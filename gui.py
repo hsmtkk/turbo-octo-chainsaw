@@ -1,111 +1,65 @@
-from typing import Dict, Optional, Union
-
-from autogen import Agent, AssistantAgent, UserProxyAgent, config_list_from_json
 import chainlit as cl
+import uuid
+from langchain_openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain_community.vectorstores import FAISS
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-TASK = "Plot a chart of NVDA stock price change YTD and save it on disk."
-
-
-async def ask_helper(func, **kwargs):
-    res = await func(**kwargs).send()
-    while not res:
-        res = await func(**kwargs).send()
-    return res
-
-
-class ChainlitAssistantAgent(AssistantAgent):
-    def send(
-        self,
-        message: Union[Dict, str],
-        recipient: Agent,
-        request_reply: Optional[bool] = None,
-        silent: Optional[bool] = False,
-    ) -> bool:
-        cl.run_sync(
-            cl.Message(
-                content=f'*Sending message to "{recipient.name}":*\n\n{message}',
-                author="AssistantAgent",
-            ).send()
-        )
-        super(ChainlitAssistantAgent, self).send(
-            message=message,
-            recipient=recipient,
-            request_reply=request_reply,
-            silent=silent,
-        )
+store = {}
 
 
-class ChainlitUserProxyAgent(UserProxyAgent):
-    def get_human_input(self, prompt: str) -> str:
-        if prompt.startswith(
-            "Provide feedback to assistant. Press enter to skip and use auto-reply"
-        ):
-            res = cl.run_sync(
-                ask_helper(
-                    cl.AskActionMessage,
-                    content="Continue or provide feedback?",
-                    actions=[
-                        cl.Action(
-                            name="continue", value="continue", label="✅ Continue"
-                        ),
-                        cl.Action(
-                            name="feedback",
-                            value="feedback",
-                            label="💬 Provide feedback",
-                        ),
-                        cl.Action( 
-                            name="exit",
-                            value="exit", 
-                            label="🔚 Exit Conversation" 
-                        ),
-                    ],
-                )
-            )
-            if res.get("value") == "continue":
-                return ""
-            if res.get("value") == "exit":
-                return "exit"
-
-        reply = cl.run_sync(ask_helper(cl.AskUserMessage, content=prompt, timeout=60))
-        print(f"{reply=}")
-        return reply["output"]
-
-    def send(
-        self,
-        message: Union[Dict, str],
-        recipient: Agent,
-        request_reply: Optional[bool] = None,
-        silent: Optional[bool] = False,
-    ):
-        cl.run_sync(
-            cl.Message(
-                content=f'*Sending message to "{recipient.name}"*:\n\n{message}',
-                author="UserProxyAgent",
-            ).send()
-        )
-        super(ChainlitUserProxyAgent, self).send(
-            message=message,
-            recipient=recipient,
-            request_reply=request_reply,
-            silent=silent,
-        )
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    if session_id not in store:
+        store[session_id] = ChatMessageHistory()
+    return store[session_id]
 
 
 @cl.on_chat_start
-async def on_chat_start():
-    config_list = config_list_from_json(env_or_file="OAI_CONFIG_LIST")
-    assistant = ChainlitAssistantAgent(
-        "assistant", llm_config={"config_list": config_list}
+def on_chat_start():
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    db = FAISS.load_local("faiss", embeddings, allow_dangerous_deserialization=True)
+    retriever = db.as_retriever()
+    llm = ChatOpenAI(model="gpt-4o-mini")
+    system_prompt = (
+        "Use the given context to answer the question. "
+        "If you don't know the answer, say you don't know. "
+        "Use three sentence maximum and keep the answer concise. "
+        "Context: {context}"
     )
-    user_proxy = ChainlitUserProxyAgent(
-        "user_proxy",
-        code_execution_config={
-            "work_dir": "workspace",
-            "use_docker": False,
-        },
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
     )
-    await cl.Message(content=f"Starting agents on task: {TASK}...").send()
-    await cl.make_async(user_proxy.initiate_chat)(
-        assistant,
-        message=TASK,
+    question_answer_chain = create_stuff_documents_chain(llm, prompt)
+    chain = create_retrieval_chain(retriever, question_answer_chain)
+    conversational_rag_chain = RunnableWithMessageHistory(
+        chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+        output_messages_key="answer",
     )
+    cl.user_session.set("conversational_rag_chain", conversational_rag_chain)
+    cl.user_session.set("session_id", str(uuid.uuid4()))
+
+
+@cl.on_message
+async def main(message: cl.Message):
+    conversational_rag_chain: RunnableWithMessageHistory = cl.user_session.get(
+        "conversational_rag_chain"
+    )
+    session_id = cl.user_session.get("session_id")
+    user_input = message.content
+    answer = conversational_rag_chain.invoke(
+        {"input": user_input},
+        config={"configurable": {"session_id": session_id}},
+    )
+    await cl.Message(content=answer["answer"]).send()

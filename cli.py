@@ -1,5 +1,4 @@
 # https://python.langchain.com/v0.1/docs/use_cases/question_answering/chat_history/
-import os.path
 from langchain_openai import OpenAIEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain_community.vectorstores import FAISS
