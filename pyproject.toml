@@ -1,0 +1,3 @@
+[tool.taskipy.tasks]
+cli = "pipenv run python cli.py"
+gui = "pipenv run chainlit run gui.py"
